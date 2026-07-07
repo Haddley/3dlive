@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <title>3D Live — headset camera to TV, side by side</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        html, body { height: 100%; }
+        body {
+            background: #0b0d12; color: #e8eaed;
+            font: 18px/1.5 -apple-system, system-ui, sans-serif;
+            display: flex; flex-direction: column; align-items: center;
+        }
+        .screen { width: 100%; max-width: 900px; padding: 2rem 1.5rem; }
+        .hidden { display: none !important; }
+        h1 { font-size: 2rem; margin-bottom: 0.25rem; }
+        .sub { color: #9aa0a6; margin-bottom: 2rem; }
+        .btn {
+            display: block; width: 100%; margin: 0.8rem 0; padding: 1rem 1.4rem;
+            font-size: 1.3rem; font-weight: 600; border: 2px solid transparent; border-radius: 12px;
+            background: #1d2430; color: #e8eaed; cursor: pointer; text-align: left;
+        }
+        .btn-primary { background: #8ab4f8; color: #0b0d12; }
+        /* Firestick / Silk navigates by D-pad focus — make it unmissable. */
+        .btn:focus, input:focus, select:focus { outline: none; border-color: #f8c78a; }
+        .btn:hover { filter: brightness(1.15); }
+        input, select {
+            font-size: 1.3rem; padding: 0.7rem 0.9rem; border-radius: 10px;
+            border: 2px solid #2a3342; background: #141922; color: #e8eaed; width: 100%;
+        }
+        input#fCode { text-transform: uppercase; letter-spacing: 0.4em; font-weight: 700; text-align: center; }
+        label { display: block; color: #9aa0a6; font-size: 0.95rem; margin: 1rem 0 0.3rem; }
+        .err { color: #f28b82; margin-top: 1rem; min-height: 1.5em; }
+        .status { color: #9aa0a6; margin-top: 1rem; }
+
+        /* Headset lobby */
+        .code-big { font-size: 4rem; font-weight: 800; letter-spacing: 0.25em; color: #8ab4f8; }
+        .qr { width: 180px; height: 180px; margin: 1rem 0; border-radius: 8px; overflow: hidden; }
+        .qr svg { width: 100%; height: 100%; display: block; }
+        .row { display: flex; gap: 1.5rem; flex-wrap: wrap; align-items: flex-start; }
+        .row > div { flex: 1 1 260px; }
+        #preview { width: 100%; border-radius: 10px; background: #000; margin-top: 1rem; }
+        .stats { font-family: ui-monospace, monospace; font-size: 0.9rem; color: #9aa0a6; margin-top: 0.5rem; }
+
+        /* Viewer: fullscreen side-by-side video */
+        body.viewer-live { display: block; overflow: hidden; background: #000; cursor: none; }
+        #tvWrap { position: fixed; inset: 0; background: #000; }
+        #tvVideo { width: 100%; height: 100%; object-fit: fill; background: #000; }
+        #tvVideo.contain { object-fit: contain; }
+        #tvOverlay {
+            position: fixed; top: 1.2rem; left: 50%; transform: translateX(-50%);
+            background: rgba(11, 13, 18, 0.75); border-radius: 12px; padding: 0.6rem 1.4rem;
+            font-size: 1.1rem; transition: opacity 0.8s; pointer-events: none;
+        }
+        #tvOverlay.faded { opacity: 0; }
+    </style>
+</head>
+
+<body>
+
+    <!-- ── Home: pick a role ── -->
+    <div id="s-home" class="screen">
+        <h1>🥽 3D Live</h1>
+        <div class="sub">Live side-by-side 3D from a Quest headset's cameras, on any screen.</div>
+        <button class="btn btn-primary" onclick="startHeadset()">🥽 I'm the headset — start the cameras</button>
+        <label for="fCode">Room code from the headset</label>
+        <input id="fCode" maxlength="4" autocomplete="off" placeholder="ABCD">
+        <button class="btn" onclick="joinFromForm()">📺 I'm a viewer — watch the stream</button>
+        <div class="err" id="homeErr"></div>
+    </div>
+
+    <!-- ── Headset: room + camera controls + preview ── -->
+    <div id="s-headset" class="screen hidden">
+        <h1>Streaming room</h1>
+        <div class="code-big" id="hsCode">····</div>
+        <div class="status">Viewers open <b id="hsUrl"></b> and enter the code — or scan:</div>
+        <div class="row">
+            <div>
+                <div class="qr" id="hsQr"></div>
+                <div class="status" id="hsViewers">0 viewers connected</div>
+                <div class="stats" id="hsStats"></div>
+                <button class="btn" onclick="stopHeadset()">⏹ Stop streaming</button>
+            </div>
+            <div>
+                <label for="selL">Left-eye camera</label>
+                <select id="selL" onchange="switchCamera('L')"></select>
+                <label for="selR">Right-eye camera</label>
+                <select id="selR" onchange="switchCamera('R')"></select>
+                <div class="err" id="hsErr"></div>
+            </div>
+        </div>
+        <canvas id="preview"></canvas>
+    </div>
+
+    <!-- ── Viewer: waiting / live ── -->
+    <div id="s-viewer" class="screen hidden">
+        <h1>📺 Connecting…</h1>
+        <div class="status" id="vStatus">Reaching the headset…</div>
+    </div>
+    <div id="tvWrap" class="hidden">
+        <video id="tvVideo" autoplay muted playsinline></video>
+        <div id="tvOverlay">3D Live · SBS · press any button for options</div>
+    </div>
+
+    <script>
+        'use strict';
+
+        // TURN relay (Metered) so viewers on restrictive/remote networks can connect,
+        // not just those behind friendly NATs. Applied to every Peer below.
+        // NOTE: video over TURN eats relay quota fast — same-LAN viewers (the normal
+        // Firestick case) connect directly and cost nothing.
+        const ICE_CFG = { config: { iceServers: [
+            { urls: 'stun:stun.relay.metered.ca:80' },
+            { urls: 'turn:global.relay.metered.ca:80', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' },
+            { urls: 'turn:global.relay.metered.ca:80?transport=tcp', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' },
+            { urls: 'turn:global.relay.metered.ca:443', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' },
+            { urls: 'turns:global.relay.metered.ca:443?transport=tcp', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' }
+        ] } };
+
+        const PFX = '3DLIVE-';
+        const EYE_W = 1280;          // per-eye width cap; SBS canvas is twice this
+        const CAPTURE_FPS = 30;
+
+        // ── State ──
+        let peer = null, roomCode = '';
+        let viewerConns = {};        // peerId -> { conn, call }
+        let sbsStream = null;        // canvas.captureStream — the one stream every viewer gets
+        let camL = null, camR = null;               // MediaStreams feeding each half
+        let vidL = null, vidR = null;               // hidden <video> elements for drawing
+        let devices = [];            // videoinput MediaDeviceInfo list
+        let rafId = 0, frames = 0, lastFpsT = 0;
+
+        const $ = (id) => document.getElementById(id);
+        function show(id) {
+            for (const s of ['s-home', 's-headset', 's-viewer', 'tvWrap']) $(s).classList.add('hidden');
+            $(id).classList.remove('hidden');
+        }
+        function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+
+        // ── QR code (SVG, from the games repo) ──
+        function qrSVG(url) {
+            try {
+                const qr = qrcode(0, 'M');
+                qr.addData(url); qr.make();
+                const n = qr.getModuleCount(), m = 2, size = n + m * 2;
+                let rects = '';
+                for (let r = 0; r < n; r++)
+                    for (let c = 0; c < n; c++)
+                        if (qr.isDark(r, c)) rects += `<rect x="${c + m}" y="${r + m}" width="1.05" height="1.05"/>`;
+                return `<svg viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">` +
+                    `<rect width="${size}" height="${size}" fill="#fff"/><g fill="#0b0d12">${rects}</g></svg>`;
+            } catch (e) { return ''; }
+        }
+        function joinURL() { return location.origin + location.pathname + '?room=' + roomCode; }
+
+        // ═══════════════════════════════════════════
+        // HEADSET (host): cameras → SBS canvas → one stream, called out to every viewer
+        // ═══════════════════════════════════════════
+
+        async function startHeadset() {
+            $('homeErr').textContent = '';
+            try {
+                // Ask generically first: labels in enumerateDevices are only revealed
+                // after one successful getUserMedia.
+                camL = await navigator.mediaDevices.getUserMedia({
+                    video: { width: { ideal: EYE_W }, height: { ideal: 720 } }, audio: false
+                });
+            } catch (err) {
+                $('homeErr').textContent = 'Camera access failed: ' + err.message +
+                    ' (needs HTTPS and the Quest browser camera permission)';
+                return;
+            }
+            devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+            buildCameraSelectors();
+            await pickDefaultCameras();
+            attachVideos();          // ensure the preview runs even if device re-open failed
+            startCompositor();
+            makeRoom();
+            show('s-headset');
+        }
+
+        function buildCameraSelectors() {
+            const opts = devices.map((d, i) =>
+                `<option value="${esc(d.deviceId)}">${esc(d.label || 'Camera ' + (i + 1))}</option>`).join('');
+            $('selL').innerHTML = opts;
+            $('selR').innerHTML = opts + `<option value="__mono__">— same as left eye —</option>`;
+        }
+
+        async function pickDefaultCameras() {
+            // Quest exposes the passthrough cameras via getUserMedia; prefer devices
+            // labelled left/right, else first two, else mono (one camera in both halves).
+            const byLabel = (re) => devices.find(d => re.test(d.label || ''));
+            const dL = byLabel(/left/i) || devices[0];
+            const dR = byLabel(/right/i) || (devices.length > 1 ? devices.find(d => d !== dL) : null);
+            if (dL) { $('selL').value = dL.deviceId; await openCamera('L', dL.deviceId); }
+            if (dR) { $('selR').value = dR.deviceId; await openCamera('R', dR.deviceId); }
+            else $('selR').value = '__mono__';
+        }
+
+        async function openCamera(eye, deviceId) {
+            let stream;
+            try {
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: { deviceId: { exact: deviceId }, width: { ideal: EYE_W }, height: { ideal: 720 } },
+                    audio: false
+                });
+            } catch (err) {
+                $('hsErr').textContent = 'Could not open camera: ' + err.message;
+                return;
+            }
+            $('hsErr').textContent = '';
+            if (eye === 'L') {
+                if (camL && camL !== camR) camL.getTracks().forEach(t => t.stop());
+                camL = stream;
+            } else {
+                if (camR && camR !== camL) camR.getTracks().forEach(t => t.stop());
+                camR = stream;
+            }
+            attachVideos();
+        }
+
+        async function switchCamera(eye) {
+            const val = $(eye === 'L' ? 'selL' : 'selR').value;
+            if (val === '__mono__') {
+                if (camR && camR !== camL) camR.getTracks().forEach(t => t.stop());
+                camR = null;
+                attachVideos();
+                return;
+            }
+            await openCamera(eye, val);
+        }
+
+        function attachVideos() {
+            if (!vidL) {
+                vidL = document.createElement('video'); vidR = document.createElement('video');
+                for (const v of [vidL, vidR]) { v.muted = true; v.playsInline = true; }
+            }
+            if (vidL.srcObject !== camL) { vidL.srcObject = camL; vidL.play().catch(() => {}); }
+            const rSrc = camR || camL;   // mono: duplicate the left feed
+            if (vidR.srcObject !== rSrc) { vidR.srcObject = rSrc; vidR.play().catch(() => {}); }
+        }
+
+        // The wrinkle: compose the two feeds side by side (like three.js
+        // StereoEffect's split viewports) so ONE video track carries the
+        // full-SBS frame. Viewers just play it — no sync or track juggling,
+        // and camera switches mid-stream need no renegotiation.
+        function startCompositor() {
+            const cv = $('preview'), ctx = cv.getContext('2d');
+            cv.width = EYE_W * 2; cv.height = 720;
+            const draw = () => {
+                if (vidL && vidL.videoWidth) {
+                    const eyeH = Math.round(EYE_W * vidL.videoHeight / vidL.videoWidth);
+                    if (cv.height !== eyeH) { cv.height = eyeH; }
+                    ctx.drawImage(vidL, 0, 0, EYE_W, eyeH);
+                    if (vidR && vidR.videoWidth) ctx.drawImage(vidR, EYE_W, 0, EYE_W, eyeH);
+                    frames++;
+                }
+                const now = performance.now();
+                if (now - lastFpsT > 1000) {
+                    const fps = Math.round(frames * 1000 / (now - lastFpsT));
+                    frames = 0; lastFpsT = now;
+                    $('hsStats').textContent =
+                        `${cv.width}×${cv.height} full-SBS · ~${fps} fps · ` +
+                        (camR ? 'stereo (two cameras)' : 'mono (left duplicated)');
+                }
+                rafId = requestAnimationFrame(draw);
+            };
+            rafId = requestAnimationFrame(draw);
+            sbsStream = cv.captureStream(CAPTURE_FPS);
+            sbsStream.getVideoTracks()[0].contentHint = 'motion';
+        }
+
+        // ── Room (host-authoritative, one headset, many viewers) ──
+        function makeRoom() {
+            const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+            roomCode = Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+            peer = new Peer(PFX + roomCode, ICE_CFG);
+            peer.on('open', () => {
+                $('hsCode').textContent = roomCode;
+                $('hsUrl').textContent = location.host + location.pathname;
+                $('hsQr').innerHTML = qrSVG(joinURL());
+            });
+            peer.on('connection', (conn) => setupViewerConn(conn));
+            // The broker periodically drops the socket; when it does the room ID is
+            // de-registered and new viewers get 'peer-unavailable'. Reconnect to
+            // re-list the room so late joiners can still find it.
+            peer.on('disconnected', () => { try { if (peer && !peer.destroyed) peer.reconnect(); } catch (_) {} });
+            peer.on('error', (e) => {
+                if (e && (e.type === 'network' || e.type === 'disconnected' || e.type === 'server-error' ||
+                          e.type === 'socket-error' || e.type === 'socket-closed')) {
+                    try { if (peer && !peer.destroyed && peer.disconnected) peer.reconnect(); } catch (_) {}
+                    return;
+                }
+                if (e && e.type === 'unavailable-id') {                         // code collision: reroll
+                    try { peer.destroy(); } catch (_) {}
+                    makeRoom(); return;
+                }
+                $('hsErr').textContent = 'Connection error: ' + e.message;
+            });
+        }
+
+        function setupViewerConn(conn) {
+            conn.on('data', (msg) => {
+                if (msg && msg.type === 'join_viewer' && !viewerConns[conn.peer]) {
+                    const call = peer.call(conn.peer, sbsStream);
+                    viewerConns[conn.peer] = { conn, call };
+                    updateViewerCount();
+                }
+            });
+            conn.on('close', () => dropViewer(conn.peer));
+            conn.on('error', () => dropViewer(conn.peer));
+        }
+
+        function dropViewer(id) {
+            const v = viewerConns[id];
+            if (!v) return;
+            try { v.call && v.call.close(); } catch (_) {}
+            delete viewerConns[id];
+            updateViewerCount();
+        }
+
+        function updateViewerCount() {
+            const n = Object.keys(viewerConns).length;
+            $('hsViewers').textContent = n + (n === 1 ? ' viewer connected' : ' viewers connected');
+        }
+
+        function stopHeadset() {
+            cancelAnimationFrame(rafId);
+            for (const s of new Set([camL, camR])) s && s.getTracks().forEach(t => t.stop());
+            camL = camR = sbsStream = null;
+            try { peer && peer.destroy(); } catch (_) {}
+            peer = null; viewerConns = {};
+            location.href = location.pathname;   // clean reload back to home
+        }
+
+        // ═══════════════════════════════════════════
+        // VIEWER (TV / Firestick / phone): join by code, play the SBS stream
+        // ═══════════════════════════════════════════
+
+        function joinFromForm() {
+            const code = $('fCode').value.trim().toUpperCase();
+            if (!/^[A-Z]{4}$/.test(code)) { $('homeErr').textContent = 'Enter the 4-letter room code.'; return; }
+            joinAsViewer(code);
+        }
+
+        function joinAsViewer(code, _attempt) {
+            const attempt = _attempt || 1;
+            show('s-viewer');
+            $('vStatus').textContent = 'Reaching the headset… (room ' + code + ')';
+
+            let connected = false, done = false, lost = false, watchTimer = 0;
+            // A page-close/crash on the headset often never fires the data
+            // connection's 'close' — the ICE watcher below is the reliable signal,
+            // so every loss path funnels through here exactly once.
+            const lostOnce = () => {
+                if (lost || !connected) return;
+                lost = true;
+                clearInterval(watchTimer);
+                headsetLost(code);
+            };
+            // peer-unavailable and negotiation failures are often transient —
+            // funnel every pre-connect failure through one retry-or-give-up path.
+            const fail = () => {
+                if (connected || done) return;
+                done = true;
+                try { peer && peer.destroy(); } catch (_) {}
+                peer = null;
+                if (attempt < 3) { setTimeout(() => joinAsViewer(code, attempt + 1), 700); return; }
+                // On a TV, "press retry" is a chore — keep trying quietly instead.
+                $('vStatus').textContent = 'Room "' + code + '" not found yet. Retrying — start the headset, or reload to enter a different code.';
+                setTimeout(() => joinAsViewer(code, 1), 4000);
+            };
+
+            peer = new Peer(undefined, ICE_CFG);
+            peer.on('open', () => {
+                const hostConn = peer.connect(PFX + code, { reliable: true });
+                hostConn.on('open', () => {
+                    connected = true;
+                    hostConn.send({ type: 'join_viewer' });
+                    $('vStatus').textContent = 'Connected. Waiting for video…';
+                });
+                hostConn.on('close', lostOnce);
+                hostConn.on('error', fail);
+            });
+            peer.on('call', (call) => {
+                call.answer();   // receive-only: no stream back
+                call.on('stream', (stream) => showTv(stream, code));
+                call.on('close', lostOnce);
+                let downTicks = 0;
+                watchTimer = setInterval(() => {
+                    const pc = call.peerConnection;
+                    const st = pc && (pc.connectionState || pc.iceConnectionState);
+                    if (st === 'failed' || st === 'closed') return lostOnce();
+                    if (st === 'disconnected') { if (++downTicks >= 3) lostOnce(); }
+                    else downTicks = 0;
+                }, 1000);
+            });
+            peer.on('error', fail);
+        }
+
+        function headsetLost(code) {
+            document.body.classList.remove('viewer-live');
+            $('tvVideo').srcObject = null;
+            show('s-viewer');
+            $('vStatus').textContent = 'Headset disconnected. Waiting for it to come back…';
+            try { peer && peer.destroy(); } catch (_) {}
+            peer = null;
+            setTimeout(() => joinAsViewer(code, 1), 3000);
+        }
+
+        let overlayTimer = 0;
+        function showTv(stream, code) {
+            show('tvWrap');
+            document.body.classList.add('viewer-live');
+            const v = $('tvVideo');
+            v.srcObject = stream;
+            v.play().catch(() => {});
+            flashOverlay('3D Live · room ' + code + ' · full-SBS');
+            // Any remote/keyboard press: show overlay; OK/Enter toggles fill vs contain.
+            document.onkeydown = (e) => {
+                if (e.key === 'Enter') {
+                    v.classList.toggle('contain');
+                    flashOverlay(v.classList.contains('contain') ? 'Aspect: contain (letterboxed)' : 'Aspect: fill (squeezed half-SBS)');
+                } else flashOverlay('3D Live · room ' + code + ' · OK button toggles aspect');
+            };
+            v.onclick = () => document.onkeydown({ key: 'Enter' });
+        }
+
+        function flashOverlay(text) {
+            const o = $('tvOverlay');
+            o.textContent = text;
+            o.classList.remove('faded');
+            clearTimeout(overlayTimer);
+            overlayTimer = setTimeout(() => o.classList.add('faded'), 4000);
+        }
+
+        // ── Boot: a ?room= link (QR scan) goes straight to viewing ──
+        const urlRoom = new URLSearchParams(location.search).get('room');
+        if (urlRoom && /^[A-Za-z]{4}$/.test(urlRoom)) joinAsViewer(urlRoom.toUpperCase());
+        else $('fCode').focus();
+    </script>
+
+</body>
+
+</html>
