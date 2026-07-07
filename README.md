@@ -37,16 +37,24 @@ looks like) vs `contain` (letterboxed at true double-wide aspect).
   (1280px per eye) and streams `canvas.captureStream(30)` as a single video
   track. Viewers are dumb `<video>` players — no track juggling, guaranteed
   eye sync, and switching cameras mid-stream needs no renegotiation.
-- **Cameras**: after permission, all `videoinput` devices are listed in
-  left/right-eye dropdowns; devices labelled "left"/"right" are auto-picked.
-  With a single camera the left feed is duplicated into both halves (mono).
-  Note Quest exposes its passthrough cameras via `getUserMedia` — what the
-  browser actually lists varies by Horizon OS version.
+- **Cameras**: Quest 3 (Horizon OS v77+, Browser 39+) exposes three
+  `videoinput` devices: a front avatar camera plus left and right passthrough
+  cameras. But the camera service generally allows **one open camera at a
+  time**, so the app starts in mono (first camera duplicated into both
+  halves) and never re-opens a device it already holds. Stereo is opt-in via
+  the right-eye dropdown: the second camera is only accepted once frames
+  actually arrive (verified with `requestVideoFrameCallback`), and a watchdog
+  reverts to mono if it goes dark mid-stream. A "left feed is already
+  side-by-side" pass-through mode covers cameras that deliver a combined SBS
+  frame. Per-eye status and the device list are shown on the headset page.
 - **Resilience** (ported from herdmind in the games repo): the host peer
   reconnects to the broker on drops so late joiners can still find the room;
   viewers retry joining 3× then keep polling quietly, and auto-rejoin if the
   headset disconnects and comes back.
-- **TURN quota**: the Metered credentials are shared with the games repo
-  (free tier, ~50 GB/month). Same-LAN viewers connect directly and cost
-  nothing; a remote viewer relaying 30 fps video will eat the quota — keep an
-  eye on dashboard.metered.ca if you share codes outside the house.
+- **TURN is opt-in, off by default**: relayed 30 fps video would eat the
+  Metered quota (free tier ~50 GB/month, credentials shared with the games
+  repo), so the default ICE config is STUN-only. Same-LAN and VPN-LAN
+  connections are direct host-candidate connections and always work without
+  TURN. A checkbox on the home screen (persisted per device in
+  localStorage under `3dlive-turn`) adds the relay for viewers on genuinely
+  different networks — enable it on both the headset and that viewer.

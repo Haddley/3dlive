@@ -34,6 +34,8 @@
         }
         input#fCode { text-transform: uppercase; letter-spacing: 0.4em; font-weight: 700; text-align: center; }
         label { display: block; color: #9aa0a6; font-size: 0.95rem; margin: 1rem 0 0.3rem; }
+        .chk { display: flex; gap: 0.7rem; align-items: flex-start; margin-top: 1.4rem; cursor: pointer; }
+        .chk input { width: 1.4rem; height: 1.4rem; flex: none; accent-color: #8ab4f8; }
         .err { color: #f28b82; margin-top: 1rem; min-height: 1.5em; }
         .status { color: #9aa0a6; margin-top: 1rem; }
 
@@ -70,6 +72,10 @@
         <label for="fCode">Room code from the headset</label>
         <input id="fCode" maxlength="4" autocomplete="off" placeholder="ABCD">
         <button class="btn" onclick="joinFromForm()">📺 I'm a viewer — watch the stream</button>
+        <label class="chk"><input type="checkbox" id="chkTurn" onchange="toggleTurn()">
+            Use the metered.ca TURN relay — only for viewers on a different network
+            (relayed video uses the shared monthly quota). Same-LAN and VPN-LAN
+            connections are always direct and never need this.</label>
         <div class="err" id="homeErr"></div>
     </div>
 
@@ -91,6 +97,8 @@
                 <label for="selR">Right-eye camera</label>
                 <select id="selR" onchange="switchCamera('R')"></select>
                 <div class="err" id="hsErr"></div>
+                <div class="status" id="hsEyes"></div>
+                <div class="stats" id="hsDevices"></div>
             </div>
         </div>
         <canvas id="preview"></canvas>
@@ -109,17 +117,28 @@
     <script>
         'use strict';
 
-        // TURN relay (Metered) so viewers on restrictive/remote networks can connect,
-        // not just those behind friendly NATs. Applied to every Peer below.
-        // NOTE: video over TURN eats relay quota fast — same-LAN viewers (the normal
-        // Firestick case) connect directly and cost nothing.
-        const ICE_CFG = { config: { iceServers: [
-            { urls: 'stun:stun.relay.metered.ca:80' },
-            { urls: 'turn:global.relay.metered.ca:80', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' },
-            { urls: 'turn:global.relay.metered.ca:80?transport=tcp', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' },
-            { urls: 'turn:global.relay.metered.ca:443', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' },
-            { urls: 'turns:global.relay.metered.ca:443?transport=tcp', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' }
-        ] } };
+        // TURN relay (Metered) lets viewers on restrictive/remote networks connect,
+        // but relayed 30 fps video burns the shared quota fast — so it is OPT-IN,
+        // off by default, persisted per device in localStorage. STUN-only covers
+        // the normal case (Quest and Firestick on the same LAN).
+        const TURN_KEY = '3dlive-turn';
+        const turnEnabled = () => localStorage.getItem(TURN_KEY) === '1';
+        function toggleTurn() {
+            localStorage.setItem(TURN_KEY, $('chkTurn').checked ? '1' : '');
+        }
+        function iceCfg() {
+            const iceServers = [
+                { urls: 'stun:stun.l.google.com:19302' },
+                { urls: 'stun:stun.relay.metered.ca:80' },
+            ];
+            if (turnEnabled()) iceServers.push(
+                { urls: 'turn:global.relay.metered.ca:80', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' },
+                { urls: 'turn:global.relay.metered.ca:80?transport=tcp', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' },
+                { urls: 'turn:global.relay.metered.ca:443', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' },
+                { urls: 'turns:global.relay.metered.ca:443?transport=tcp', username: '35410ce7572a64d0dad7b813', credential: 'Tmwfl6WHxuBNXj2G' }
+            );
+            return { config: { iceServers } };
+        }
 
         const PFX = '3DLIVE-';
         const EYE_W = 1280;          // per-eye width cap; SBS canvas is twice this
@@ -130,6 +149,7 @@
         let viewerConns = {};        // peerId -> { conn, call }
         let sbsStream = null;        // canvas.captureStream — the one stream every viewer gets
         let camL = null, camR = null;               // MediaStreams feeding each half
+        let rightMode = '__mono__';  // '__mono__' | '__pass__' | 'device'
         let vidL = null, vidR = null;               // hidden <video> elements for drawing
         let devices = [];            // videoinput MediaDeviceInfo list
         let rafId = 0, frames = 0, lastFpsT = 0;
@@ -176,8 +196,14 @@
             }
             devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
             buildCameraSelectors();
-            await pickDefaultCameras();
-            attachVideos();          // ensure the preview runs even if device re-open failed
+            // Keep the stream we already hold as the left eye — do NOT reopen it by
+            // deviceId: Quest's camera service usually allows one open camera per
+            // page, so a second open (even of the same device) goes black or fails.
+            // Stereo is opt-in via the right-eye dropdown and verified below.
+            const lId = (camL.getVideoTracks()[0].getSettings() || {}).deviceId;
+            if (lId) $('selL').value = lId;
+            $('selR').value = '__mono__';
+            attachVideos();
             startCompositor();
             makeRoom();
             show('s-headset');
@@ -185,63 +211,124 @@
 
         function buildCameraSelectors() {
             const opts = devices.map((d, i) =>
-                `<option value="${esc(d.deviceId)}">${esc(d.label || 'Camera ' + (i + 1))}</option>`).join('');
+                `<option value="${esc(d.deviceId)}">${esc(d.label || 'Camera ' + i)}</option>`).join('');
             $('selL').innerHTML = opts;
-            $('selR').innerHTML = opts + `<option value="__mono__">— same as left eye —</option>`;
+            $('selR').innerHTML =
+                `<option value="__mono__">— same as left eye (mono) —</option>` +
+                `<option value="__pass__">— left feed is already side-by-side —</option>` + opts;
+            $('hsDevices').innerHTML = 'Cameras found: ' +
+                (devices.map((d, i) => `[${i}] ${esc(d.label || 'no label')}`).join(' · ') || 'none');
         }
 
-        async function pickDefaultCameras() {
-            // Quest exposes the passthrough cameras via getUserMedia; prefer devices
-            // labelled left/right, else first two, else mono (one camera in both halves).
-            const byLabel = (re) => devices.find(d => re.test(d.label || ''));
-            const dL = byLabel(/left/i) || devices[0];
-            const dR = byLabel(/right/i) || (devices.length > 1 ? devices.find(d => d !== dL) : null);
-            if (dL) { $('selL').value = dL.deviceId; await openCamera('L', dL.deviceId); }
-            if (dR) { $('selR').value = dR.deviceId; await openCamera('R', dR.deviceId); }
-            else $('selR').value = '__mono__';
+        function camLabel(stream) {
+            if (!stream) return '—';
+            const t = stream.getVideoTracks()[0];
+            const id = (t.getSettings() || {}).deviceId;
+            const d = devices.find(x => x.deviceId === id);
+            return (d && d.label) || t.label || 'camera';
         }
 
-        async function openCamera(eye, deviceId) {
-            let stream;
+        async function tryOpen(deviceId) {
             try {
-                stream = await navigator.mediaDevices.getUserMedia({
+                return await navigator.mediaDevices.getUserMedia({
                     video: { deviceId: { exact: deviceId }, width: { ideal: EYE_W }, height: { ideal: 720 } },
                     audio: false
                 });
-            } catch (err) {
-                $('hsErr').textContent = 'Could not open camera: ' + err.message;
-                return;
-            }
-            $('hsErr').textContent = '';
-            if (eye === 'L') {
-                if (camL && camL !== camR) camL.getTracks().forEach(t => t.stop());
-                camL = stream;
+            } catch (e) { return null; }
+        }
+
+        function stopEye(eye) {
+            const s = eye === 'L' ? camL : camR;
+            if (s) s.getTracks().forEach(t => t.stop());
+            if (eye === 'L') camL = null; else camR = null;
+        }
+
+        // Open a device for one eye and only accept it once frames actually arrive —
+        // on Quest a second camera can "open" fine yet deliver nothing but black.
+        async function openCamera(eye, deviceId) {
+            const prev = eye === 'L' ? camL : camR;
+            const prevId = prev && (prev.getVideoTracks()[0].getSettings() || {}).deviceId;
+            stopEye(eye);                       // release-before-open: one camera at a time
+            const stream = await tryOpen(deviceId);
+            if (stream) {
+                if (eye === 'L') camL = stream; else camR = stream;
+                attachVideos();
+                if (await eyeDelivers(eye)) { $('hsErr').textContent = ''; updateEyeStatus(); return true; }
+                $('hsErr').textContent = (eye === 'L' ? 'Left' : 'Right') +
+                    ' camera opened but delivered no frames — this headset probably allows only one camera at a time.';
+                stopEye(eye);
             } else {
-                if (camR && camR !== camL) camR.getTracks().forEach(t => t.stop());
-                camR = stream;
+                $('hsErr').textContent = 'Could not open that camera' +
+                    (eye === 'R' ? ' while the left one is running (one camera at a time?)' : '') + '.';
             }
-            attachVideos();
+            // Recover to a working state.
+            if (eye === 'R') { rightMode = '__mono__'; $('selR').value = '__mono__'; }
+            else if (prevId) {
+                const back = await tryOpen(prevId);
+                if (back) { camL = back; $('selL').value = prevId; }
+                else $('hsErr').textContent += ' Reopening the previous camera also failed — reload the page.';
+            }
+            attachVideos(); updateEyeStatus();
+            return false;
         }
 
         async function switchCamera(eye) {
+            $('hsErr').textContent = '';
             const val = $(eye === 'L' ? 'selL' : 'selR').value;
-            if (val === '__mono__') {
-                if (camR && camR !== camL) camR.getTracks().forEach(t => t.stop());
-                camR = null;
-                attachVideos();
+            if (eye === 'R' && (val === '__mono__' || val === '__pass__')) {
+                stopEye('R'); rightMode = val;
+                attachVideos(); updateEyeStatus();
                 return;
             }
+            if (eye === 'R') rightMode = 'device';
             await openCamera(eye, val);
+        }
+
+        // Count real decoded frames per <video> so liveness is measurable
+        // (readyState alone lies: a dead camera still reports HAVE_ENOUGH_DATA).
+        function watchFrames(v) {
+            v._frames = 0;
+            if (v.requestVideoFrameCallback) {
+                const cb = () => { v._frames++; v.requestVideoFrameCallback(cb); };
+                v.requestVideoFrameCallback(cb);
+            }
+        }
+
+        async function eyeDelivers(eye) {
+            const v = eye === 'L' ? vidL : vidR;
+            v._frames = 0;
+            const t0 = performance.now();
+            while (performance.now() - t0 < 2500) {
+                if (v.requestVideoFrameCallback ? v._frames > 2
+                    : (v.readyState >= 2 && v.videoWidth > 0)) return true;
+                await new Promise(r => setTimeout(r, 150));
+            }
+            return false;
         }
 
         function attachVideos() {
             if (!vidL) {
                 vidL = document.createElement('video'); vidR = document.createElement('video');
-                for (const v of [vidL, vidR]) { v.muted = true; v.playsInline = true; }
+                for (const v of [vidL, vidR]) {
+                    v.muted = true; v.playsInline = true;
+                    // Some browsers don't decode a detached <video> — keep them in
+                    // the DOM, just invisible.
+                    v.style.cssText = 'position:fixed;left:-9999px;top:0;width:2px;height:2px;opacity:0';
+                    document.body.appendChild(v);
+                    watchFrames(v);
+                }
             }
-            if (vidL.srcObject !== camL) { vidL.srcObject = camL; vidL.play().catch(() => {}); }
-            const rSrc = camR || camL;   // mono: duplicate the left feed
-            if (vidR.srcObject !== rSrc) { vidR.srcObject = rSrc; vidR.play().catch(() => {}); }
+            if (vidL.srcObject !== camL) { vidL.srcObject = camL; vidL._frames = 0; vidL.play().catch(() => {}); }
+            const rSrc = (rightMode === 'device' && camR) ? camR : camL;   // mono/pass: mirror left
+            if (vidR.srcObject !== rSrc) { vidR.srcObject = rSrc; vidR._frames = 0; vidR.play().catch(() => {}); }
+        }
+
+        function updateEyeStatus() {
+            const dims = (v) => v && v.videoWidth ? ` ${v.videoWidth}×${v.videoHeight}` : ' (no frames yet)';
+            const right = rightMode === '__pass__' ? 'passing left feed through as-is'
+                : (rightMode === 'device' && camR) ? esc(camLabel(camR)) + dims(vidR)
+                : 'mono — left eye duplicated';
+            $('hsEyes').innerHTML = `Left: <b>${esc(camLabel(camL))}${dims(vidL)}</b> · Right: <b>${right}</b>`;
         }
 
         // The wrinkle: compose the two feeds side by side (like three.js
@@ -253,10 +340,17 @@
             cv.width = EYE_W * 2; cv.height = 720;
             const draw = () => {
                 if (vidL && vidL.videoWidth) {
-                    const eyeH = Math.round(EYE_W * vidL.videoHeight / vidL.videoWidth);
-                    if (cv.height !== eyeH) { cv.height = eyeH; }
-                    ctx.drawImage(vidL, 0, 0, EYE_W, eyeH);
-                    if (vidR && vidR.videoWidth) ctx.drawImage(vidR, EYE_W, 0, EYE_W, eyeH);
+                    if (rightMode === '__pass__') {
+                        // The left feed already contains both eyes: full-width as-is.
+                        const h = Math.round(cv.width * vidL.videoHeight / vidL.videoWidth);
+                        if (cv.height !== h) cv.height = h;
+                        ctx.drawImage(vidL, 0, 0, cv.width, h);
+                    } else {
+                        const eyeH = Math.round(EYE_W * vidL.videoHeight / vidL.videoWidth);
+                        if (cv.height !== eyeH) cv.height = eyeH;
+                        ctx.drawImage(vidL, 0, 0, EYE_W, eyeH);
+                        if (vidR && vidR.videoWidth) ctx.drawImage(vidR, EYE_W, 0, EYE_W, eyeH);
+                    }
                     frames++;
                 }
                 const now = performance.now();
@@ -265,20 +359,41 @@
                     frames = 0; lastFpsT = now;
                     $('hsStats').textContent =
                         `${cv.width}×${cv.height} full-SBS · ~${fps} fps · ` +
-                        (camR ? 'stereo (two cameras)' : 'mono (left duplicated)');
+                        (rightMode === '__pass__' ? 'pass-through (feed is already SBS)'
+                            : (rightMode === 'device' && camR) ? 'stereo (two cameras)'
+                            : 'mono (left duplicated)');
                 }
                 rafId = requestAnimationFrame(draw);
             };
             rafId = requestAnimationFrame(draw);
             sbsStream = cv.captureStream(CAPTURE_FPS);
             sbsStream.getVideoTracks()[0].contentHint = 'motion';
+
+            // Watchdog: a stereo right camera that stops delivering (headset only
+            // really supports one) silently blacks out half the stream — detect it
+            // via the frame counters and fall back to mono.
+            let lastRF = 0, rDead = 0;
+            setInterval(() => {
+                updateEyeStatus();
+                if (rightMode !== 'device' || !camR || !vidR.requestVideoFrameCallback) return;
+                const rf = vidR._frames;
+                if (rf === lastRF) {
+                    if (++rDead >= 4) {
+                        stopEye('R'); rightMode = '__mono__'; $('selR').value = '__mono__';
+                        attachVideos();
+                        $('hsErr').textContent = 'Right camera stopped delivering frames — reverted to mono.';
+                        rDead = 0;
+                    }
+                } else rDead = 0;
+                lastRF = rf;
+            }, 1000);
         }
 
         // ── Room (host-authoritative, one headset, many viewers) ──
         function makeRoom() {
             const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
             roomCode = Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
-            peer = new Peer(PFX + roomCode, ICE_CFG);
+            peer = new Peer(PFX + roomCode, iceCfg());
             peer.on('open', () => {
                 $('hsCode').textContent = roomCode;
                 $('hsUrl').textContent = location.host + location.pathname;
@@ -375,7 +490,7 @@
                 setTimeout(() => joinAsViewer(code, 1), 4000);
             };
 
-            peer = new Peer(undefined, ICE_CFG);
+            peer = new Peer(undefined, iceCfg());
             peer.on('open', () => {
                 const hostConn = peer.connect(PFX + code, { reliable: true });
                 hostConn.on('open', () => {
@@ -387,6 +502,7 @@
                 hostConn.on('error', fail);
             });
             peer.on('call', (call) => {
+                tvCall = call;   // kept for the stats overlay
                 call.answer();   // receive-only: no stream back
                 call.on('stream', (stream) => showTv(stream, code));
                 call.on('close', lostOnce);
@@ -412,7 +528,7 @@
             setTimeout(() => joinAsViewer(code, 1), 3000);
         }
 
-        let overlayTimer = 0;
+        let overlayTimer = 0, tvCall = null;
         function showTv(stream, code) {
             show('tvWrap');
             document.body.classList.add('viewer-live');
@@ -420,12 +536,24 @@
             v.srcObject = stream;
             v.play().catch(() => {});
             flashOverlay('3D Live · room ' + code + ' · full-SBS');
-            // Any remote/keyboard press: show overlay; OK/Enter toggles fill vs contain.
-            document.onkeydown = (e) => {
+            // Any remote/keyboard press: show overlay + receive stats;
+            // OK/Enter toggles fill vs contain.
+            document.onkeydown = async (e) => {
                 if (e.key === 'Enter') {
                     v.classList.toggle('contain');
                     flashOverlay(v.classList.contains('contain') ? 'Aspect: contain (letterboxed)' : 'Aspect: fill (squeezed half-SBS)');
-                } else flashOverlay('3D Live · room ' + code + ' · OK button toggles aspect');
+                    return;
+                }
+                // Distinguish "nothing arriving" from "arriving but not shown".
+                let line = 'room ' + code + ' · ' + v.videoWidth + '×' + v.videoHeight;
+                try {
+                    const stats = await tvCall.peerConnection.getStats();
+                    stats.forEach((r) => {
+                        if (r.type === 'inbound-rtp' && r.kind === 'video')
+                            line += ' · ' + (r.framesPerSecond || 0) + ' fps · ' + r.framesDecoded + ' frames decoded';
+                    });
+                } catch (_) {}
+                flashOverlay(line + ' · OK toggles aspect');
             };
             v.onclick = () => document.onkeydown({ key: 'Enter' });
         }
@@ -439,6 +567,7 @@
         }
 
         // ── Boot: a ?room= link (QR scan) goes straight to viewing ──
+        $('chkTurn').checked = turnEnabled();
         const urlRoom = new URLSearchParams(location.search).get('room');
         if (urlRoom && /^[A-Za-z]{4}$/.test(urlRoom)) joinAsViewer(urlRoom.toUpperCase());
         else $('fCode').focus();
