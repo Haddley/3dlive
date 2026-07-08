@@ -99,6 +99,7 @@
                 <div class="err" id="hsErr"></div>
                 <div class="status" id="hsEyes"></div>
                 <div class="stats" id="hsDevices"></div>
+                <div class="status" id="hsNote" style="color:#f8c78a"></div>
             </div>
         </div>
         <canvas id="preview"></canvas>
@@ -204,9 +205,33 @@
             if (lId) $('selL').value = lId;
             $('selR').value = '__mono__';
             attachVideos();
+            await preferPassthrough(lId);
             startCompositor();
             makeRoom();
             show('s-headset');
+        }
+
+        // The browser's default camera is often the synthetic "avatar" camera —
+        // that's ALL a Quest Pro exposes, while Quest 3/3S add the real left/right
+        // passthrough cameras (Horizon OS v77+, behind the separate "headset
+        // cameras" permission). If a better-looking device exists, switch to it;
+        // openCamera verifies frames actually arrive and rolls back if not.
+        async function preferPassthrough(currentId) {
+            const score = (d) => {
+                const l = d.label || '';
+                return (/passthrough/i.test(l) ? 4 : 0) + (/\b(back|rear)\b/i.test(l) ? 2 : 0) +
+                    (/\b(left|right)\b/i.test(l) ? 1 : 0) - (/avatar|virtual|selfie/i.test(l) ? 4 : 0) -
+                    (/front/i.test(l) ? 2 : 0);
+            };
+            const cur = devices.find(d => d.deviceId === currentId);
+            const best = [...devices].sort((a, b) => score(b) - score(a))[0];
+            if (best && (!cur || best.deviceId !== cur.deviceId) && score(best) > (cur ? score(cur) : 0)) {
+                if (await openCamera('L', best.deviceId)) $('selL').value = best.deviceId;
+            }
+            if (!devices.some(d => score(d) > 0) && devices.some(d => /avatar|virtual/i.test(d.label || '')))
+                $('hsNote').textContent = 'This headset only offers the avatar camera to the browser. ' +
+                    'Real passthrough cameras need a Quest 3 or 3S on Horizon OS v77+ ' +
+                    '(and the "headset cameras" site permission, not just "virtual cameras").';
         }
 
         function buildCameraSelectors() {
