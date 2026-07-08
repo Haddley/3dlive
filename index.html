@@ -217,21 +217,59 @@
         // cameras" permission). If a better-looking device exists, switch to it;
         // openCamera verifies frames actually arrive and rolls back if not.
         async function preferPassthrough(currentId) {
-            const score = (d) => {
-                const l = d.label || '';
-                return (/passthrough/i.test(l) ? 4 : 0) + (/\b(back|rear)\b/i.test(l) ? 2 : 0) +
-                    (/\b(left|right)\b/i.test(l) ? 1 : 0) - (/avatar|virtual|selfie/i.test(l) ? 4 : 0) -
-                    (/front/i.test(l) ? 2 : 0);
-            };
+            const score = passthroughScore;
             const cur = devices.find(d => d.deviceId === currentId);
             const best = [...devices].sort((a, b) => score(b) - score(a))[0];
             if (best && (!cur || best.deviceId !== cur.deviceId) && score(best) > (cur ? score(cur) : 0)) {
                 if (await openCamera('L', best.deviceId)) $('selL').value = best.deviceId;
             }
-            if (!devices.some(d => score(d) > 0) && devices.some(d => /avatar|virtual/i.test(d.label || '')))
-                $('hsNote').textContent = 'This headset only offers the avatar camera to the browser. ' +
-                    'Real passthrough cameras need a Quest 3 or 3S on Horizon OS v77+ ' +
-                    '(and the "headset cameras" site permission, not just "virtual cameras").';
+            explainCameras(currentId);
+        }
+
+        // Say plainly what this specific headset can and can't do, so a synthetic
+        // avatar/Persona feed is never mistaken for broken passthrough.
+        function explainCameras(currentId) {
+            const el = $('hsNote');
+            const hasReal = devices.some(d => passthroughScore(d) > 0);
+            const labels = devices.map(d => d.label || '').join(' ');
+            const ua = navigator.userAgent || '';
+            const isQuest = /OculusBrowser|Quest/i.test(ua) || /avatar/i.test(labels);
+            const isVisionPro = /Vision\s?Pro|visionOS/i.test(ua) || /persona/i.test(labels) ||
+                (/Apple|Mac/i.test(ua) && /persona/i.test(labels));
+            const onlySynthetic = !hasReal &&
+                (devices.length === 0 || devices.every(d => /avatar|virtual|selfie|persona/i.test(d.label || '') || !d.label));
+
+            if (hasReal) {
+                el.style.color = '#7fd48a';
+                el.textContent = 'Passthrough camera detected — you\'re streaming the real world. ' +
+                    'Use the right-eye dropdown to add the second camera for true stereo 3D.';
+                return;
+            }
+            if (!onlySynthetic) { el.textContent = ''; return; }
+
+            el.style.color = '#f8c78a';
+            if (isVisionPro) {
+                el.innerHTML = '<b>Apple Vision Pro:</b> Safari only exposes your <b>Persona</b> ' +
+                    '(a synthetic digital likeness) — not the real passthrough cameras, which visionOS ' +
+                    'never shares with web pages (they\'re reachable only by native enterprise apps). ' +
+                    'For live 3D of your surroundings, use a <b>Quest 3 or Quest 3S</b>.';
+            } else if (isQuest) {
+                el.innerHTML = '<b>Quest Pro / Quest 2:</b> the browser only offers the synthetic ' +
+                    '<b>avatar camera</b> here. Real passthrough cameras are exposed to the browser only ' +
+                    'on <b>Quest 3 / Quest 3S</b> (Horizon OS v77+, via the separate "headset cameras" ' +
+                    'site permission — not just "virtual cameras"). This headset can\'t stream its ' +
+                    'real cameras in any browser.';
+            } else {
+                el.innerHTML = 'This device only offers a synthetic (avatar/Persona) camera to the ' +
+                    'browser, not real passthrough. Live 3D passthrough needs a <b>Quest 3 or Quest 3S</b>.';
+            }
+        }
+
+        function passthroughScore(d) {
+            const l = d.label || '';
+            return (/passthrough/i.test(l) ? 4 : 0) + (/\b(back|rear)\b/i.test(l) ? 2 : 0) +
+                (/\b(left|right)\b/i.test(l) ? 1 : 0) - (/avatar|virtual|selfie|persona/i.test(l) ? 4 : 0) -
+                (/front|user/i.test(l) ? 2 : 0);
         }
 
         function buildCameraSelectors() {
