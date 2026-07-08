@@ -32,11 +32,23 @@ looks like) vs `contain` (letterboxed at true double-wide aspect).
 - **Topology**: the headset is the room host (`3DLIVE-XXXX` peer ID). Viewers
   open a data connection, send `{type:'join_viewer'}`, and the headset calls
   each one back with the stream. One headset, N viewers.
-- **The SBS wrinkle is solved at the source**: the headset composites the
-  left-eye and right-eye camera feeds side by side onto a canvas
-  (1280px per eye) and streams `canvas.captureStream(30)` as a single video
+- **Output modes** (picked on the headset page, default **mono**):
+  - **Mono** — one camera, sent as a normal single-frame video (1280×720).
+    Best for a regular TV; the default, and the safe choice on headsets that
+    only allow one open camera at a time.
+  - **Side-by-side 3D** — two cameras composited left/right onto a
+    2×-wide canvas (1280px per eye), like three.js StereoEffect's split
+    viewports. The second camera is opt-in via the right-eye dropdown; if only
+    one is available it duplicates the left.
+  - **Pass-through** — for a camera whose feed is *already* side-by-side; it's
+    sent full-width as-is.
+- **One composited track, whatever the mode**: the headset draws the outgoing
+  frame onto a canvas and streams `canvas.captureStream(30)` as a single video
   track. Viewers are dumb `<video>` players — no track juggling, guaranteed
-  eye sync, and switching cameras mid-stream needs no renegotiation.
+  eye sync, and switching mode or camera mid-stream needs no renegotiation.
+  The headset also sends the current mode over the data channel so a viewer
+  defaults to the right aspect (letterbox a mono feed, fill each half of SBS);
+  pressing OK on the viewer overrides it.
 - **Cameras**: Quest 3 (Horizon OS v77+, Browser 39+) exposes three
   `videoinput` devices: a front avatar camera plus left and right passthrough
   cameras. But the camera service generally allows **one open camera at a

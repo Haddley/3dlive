@@ -92,9 +92,15 @@
                 <button class="btn" onclick="stopHeadset()">⏹ Stop streaming</button>
             </div>
             <div>
-                <label for="selL">Left-eye camera</label>
+                <label for="selMode">Output mode</label>
+                <select id="selMode" onchange="switchMode()">
+                    <option value="mono">Mono — one camera (normal video)</option>
+                    <option value="sbs">Side-by-side 3D — two cameras</option>
+                    <option value="pass">Side-by-side — this camera already outputs SBS</option>
+                </select>
+                <label for="selL" id="lblL">Camera</label>
                 <select id="selL" onchange="switchCamera('L')"></select>
-                <label for="selR">Right-eye camera</label>
+                <label for="selR" id="lblR">Right-eye camera</label>
                 <select id="selR" onchange="switchCamera('R')"></select>
                 <div class="err" id="hsErr"></div>
                 <div class="status" id="hsEyes"></div>
@@ -150,7 +156,8 @@
         let viewerConns = {};        // peerId -> { conn, call }
         let sbsStream = null;        // canvas.captureStream — the one stream every viewer gets
         let camL = null, camR = null;               // MediaStreams feeding each half
-        let rightMode = '__mono__';  // '__mono__' | '__pass__' | 'device'
+        let outputMode = 'mono';     // 'mono' (one camera) | 'sbs' (two side by side) | 'pass' (feed already SBS)
+        let rightMode = '__dup__';   // right half in sbs mode: '__dup__' (mirror left) | 'device'
         let vidL = null, vidR = null;               // hidden <video> elements for drawing
         let devices = [];            // videoinput MediaDeviceInfo list
         let rafId = 0, frames = 0, lastFpsT = 0;
@@ -203,7 +210,9 @@
             // Stereo is opt-in via the right-eye dropdown and verified below.
             const lId = (camL.getVideoTracks()[0].getSettings() || {}).deviceId;
             if (lId) $('selL').value = lId;
-            $('selR').value = '__mono__';
+            $('selMode').value = outputMode = 'mono';   // mono is the default: one camera
+            $('selR').value = '__dup__';
+            applyModeUI();
             attachVideos();
             await preferPassthrough(lId);
             startCompositor();
@@ -277,8 +286,7 @@
                 `<option value="${esc(d.deviceId)}">${esc(d.label || 'Camera ' + i)}</option>`).join('');
             $('selL').innerHTML = opts;
             $('selR').innerHTML =
-                `<option value="__mono__">— same as left eye (mono) —</option>` +
-                `<option value="__pass__">— left feed is already side-by-side —</option>` + opts;
+                `<option value="__dup__">— duplicate the left camera —</option>` + opts;
             $('hsDevices').innerHTML = 'Cameras found: ' +
                 (devices.map((d, i) => `[${i}] ${esc(d.label || 'no label')}`).join(' · ') || 'none');
         }
@@ -325,7 +333,7 @@
                     (eye === 'R' ? ' while the left one is running (one camera at a time?)' : '') + '.';
             }
             // Recover to a working state.
-            if (eye === 'R') { rightMode = '__mono__'; $('selR').value = '__mono__'; }
+            if (eye === 'R') { rightMode = '__dup__'; $('selR').value = '__dup__'; }
             else if (prevId) {
                 const back = await tryOpen(prevId);
                 if (back) { camL = back; $('selL').value = prevId; }
@@ -338,13 +346,34 @@
         async function switchCamera(eye) {
             $('hsErr').textContent = '';
             const val = $(eye === 'L' ? 'selL' : 'selR').value;
-            if (eye === 'R' && (val === '__mono__' || val === '__pass__')) {
-                stopEye('R'); rightMode = val;
+            if (eye === 'R' && val === '__dup__') {
+                stopEye('R'); rightMode = '__dup__';
                 attachVideos(); updateEyeStatus();
                 return;
             }
             if (eye === 'R') rightMode = 'device';
             await openCamera(eye, val);
+        }
+
+        // Gray out / disable the right-eye picker unless we're in two-camera mode.
+        function applyModeUI() {
+            const stereo = outputMode === 'sbs';
+            $('selR').disabled = !stereo;
+            $('lblR').style.opacity = $('selR').style.opacity = stereo ? '1' : '0.35';
+            $('lblL').textContent = outputMode === 'mono' ? 'Camera'
+                : outputMode === 'pass' ? 'Camera (already side-by-side)' : 'Left-eye camera';
+        }
+
+        async function switchMode() {
+            $('hsErr').textContent = '';
+            outputMode = $('selMode').value;
+            applyModeUI();
+            if (outputMode !== 'sbs') {          // one feed only — free the second camera
+                stopEye('R'); rightMode = '__dup__'; $('selR').value = '__dup__';
+            } else if (rightMode === 'device' && $('selR').value !== '__dup__') {
+                await openCamera('R', $('selR').value);   // re-open the chosen second camera
+            }
+            attachVideos(); updateEyeStatus(); broadcastMode();
         }
 
         // Count real decoded frames per <video> so liveness is measurable
@@ -382,34 +411,52 @@
                 }
             }
             if (vidL.srcObject !== camL) { vidL.srcObject = camL; vidL._frames = 0; vidL.play().catch(() => {}); }
-            const rSrc = (rightMode === 'device' && camR) ? camR : camL;   // mono/pass: mirror left
+            const rSrc = (outputMode === 'sbs' && rightMode === 'device' && camR) ? camR : camL;
             if (vidR.srcObject !== rSrc) { vidR.srcObject = rSrc; vidR._frames = 0; vidR.play().catch(() => {}); }
         }
 
         function updateEyeStatus() {
             const dims = (v) => v && v.videoWidth ? ` ${v.videoWidth}×${v.videoHeight}` : ' (no frames yet)';
-            const right = rightMode === '__pass__' ? 'passing left feed through as-is'
-                : (rightMode === 'device' && camR) ? esc(camLabel(camR)) + dims(vidR)
-                : 'mono — left eye duplicated';
+            if (outputMode === 'mono') {
+                $('hsEyes').innerHTML = `Sending: <b>${esc(camLabel(camL))}${dims(vidL)}</b> (mono, one camera)`;
+                return;
+            }
+            if (outputMode === 'pass') {
+                $('hsEyes').innerHTML = `Sending: <b>${esc(camLabel(camL))}${dims(vidL)}</b> (feed is already side-by-side)`;
+                return;
+            }
+            const right = (rightMode === 'device' && camR) ? esc(camLabel(camR)) + dims(vidR)
+                : 'duplicating left camera';
             $('hsEyes').innerHTML = `Left: <b>${esc(camLabel(camL))}${dims(vidL)}</b> · Right: <b>${right}</b>`;
         }
 
-        // The wrinkle: compose the two feeds side by side (like three.js
-        // StereoEffect's split viewports) so ONE video track carries the
-        // full-SBS frame. Viewers just play it — no sync or track juggling,
-        // and camera switches mid-stream need no renegotiation.
+        // Compose the outgoing frame onto a canvas and stream ONE video track from
+        // it (canvas.captureStream). Mono sends a single camera full-frame; SBS puts
+        // two feeds side by side like three.js StereoEffect's split viewports; pass
+        // sends an already-combined SBS feed as-is. Viewers just play the track — no
+        // sync or track juggling, and mode/camera changes need no renegotiation.
         function startCompositor() {
             const cv = $('preview'), ctx = cv.getContext('2d');
-            cv.width = EYE_W * 2; cv.height = 720;
+            cv.width = EYE_W; cv.height = 720;
             const draw = () => {
                 if (vidL && vidL.videoWidth) {
-                    if (rightMode === '__pass__') {
-                        // The left feed already contains both eyes: full-width as-is.
-                        const h = Math.round(cv.width * vidL.videoHeight / vidL.videoWidth);
+                    const aspect = vidL.videoHeight / vidL.videoWidth;
+                    if (outputMode === 'mono') {
+                        // One camera, normal frame — not doubled.
+                        const h = Math.round(EYE_W * aspect);
+                        if (cv.width !== EYE_W) cv.width = EYE_W;
+                        if (cv.height !== h) cv.height = h;
+                        ctx.drawImage(vidL, 0, 0, EYE_W, h);
+                    } else if (outputMode === 'pass') {
+                        // The feed already contains both eyes: full-width as-is.
+                        const h = Math.round(EYE_W * 2 * aspect);
+                        if (cv.width !== EYE_W * 2) cv.width = EYE_W * 2;
                         if (cv.height !== h) cv.height = h;
                         ctx.drawImage(vidL, 0, 0, cv.width, h);
                     } else {
-                        const eyeH = Math.round(EYE_W * vidL.videoHeight / vidL.videoWidth);
+                        // Two cameras side by side (right half duplicates left if mono-sourced).
+                        const eyeH = Math.round(EYE_W * aspect);
+                        if (cv.width !== EYE_W * 2) cv.width = EYE_W * 2;
                         if (cv.height !== eyeH) cv.height = eyeH;
                         ctx.drawImage(vidL, 0, 0, EYE_W, eyeH);
                         if (vidR && vidR.videoWidth) ctx.drawImage(vidR, EYE_W, 0, EYE_W, eyeH);
@@ -420,11 +467,11 @@
                 if (now - lastFpsT > 1000) {
                     const fps = Math.round(frames * 1000 / (now - lastFpsT));
                     frames = 0; lastFpsT = now;
-                    $('hsStats').textContent =
-                        `${cv.width}×${cv.height} full-SBS · ~${fps} fps · ` +
-                        (rightMode === '__pass__' ? 'pass-through (feed is already SBS)'
-                            : (rightMode === 'device' && camR) ? 'stereo (two cameras)'
-                            : 'mono (left duplicated)');
+                    const desc = outputMode === 'mono' ? 'mono (one camera)'
+                        : outputMode === 'pass' ? 'pass-through (feed is already SBS)'
+                        : (rightMode === 'device' && camR) ? 'side-by-side (two cameras)'
+                        : 'side-by-side (left duplicated)';
+                    $('hsStats').textContent = `${cv.width}×${cv.height} · ~${fps} fps · ${desc}`;
                 }
                 rafId = requestAnimationFrame(draw);
             };
@@ -432,19 +479,19 @@
             sbsStream = cv.captureStream(CAPTURE_FPS);
             sbsStream.getVideoTracks()[0].contentHint = 'motion';
 
-            // Watchdog: a stereo right camera that stops delivering (headset only
-            // really supports one) silently blacks out half the stream — detect it
-            // via the frame counters and fall back to mono.
+            // Watchdog: in two-camera mode a right camera that stops delivering
+            // (headset only really supports one) silently blacks out half the frame
+            // — detect it via the frame counters and fall back to duplicating left.
             let lastRF = 0, rDead = 0;
             setInterval(() => {
                 updateEyeStatus();
-                if (rightMode !== 'device' || !camR || !vidR.requestVideoFrameCallback) return;
+                if (outputMode !== 'sbs' || rightMode !== 'device' || !camR || !vidR.requestVideoFrameCallback) return;
                 const rf = vidR._frames;
                 if (rf === lastRF) {
                     if (++rDead >= 4) {
-                        stopEye('R'); rightMode = '__mono__'; $('selR').value = '__mono__';
+                        stopEye('R'); rightMode = '__dup__'; $('selR').value = '__dup__';
                         attachVideos();
-                        $('hsErr').textContent = 'Right camera stopped delivering frames — reverted to mono.';
+                        $('hsErr').textContent = 'Right camera stopped delivering frames — reverted to duplicating the left camera.';
                         rDead = 0;
                     }
                 } else rDead = 0;
@@ -486,11 +533,19 @@
                 if (msg && msg.type === 'join_viewer' && !viewerConns[conn.peer]) {
                     const call = peer.call(conn.peer, sbsStream);
                     viewerConns[conn.peer] = { conn, call };
+                    try { conn.send({ type: 'mode', mode: outputMode }); } catch (_) {}
                     updateViewerCount();
                 }
             });
             conn.on('close', () => dropViewer(conn.peer));
             conn.on('error', () => dropViewer(conn.peer));
+        }
+
+        // Tell every viewer the current output mode so a plain TV can letterbox a
+        // mono feed instead of stretching it (and vice-versa for SBS).
+        function broadcastMode() {
+            for (const { conn } of Object.values(viewerConns))
+                try { conn.send({ type: 'mode', mode: outputMode }); } catch (_) {}
         }
 
         function dropViewer(id) {
@@ -561,6 +616,7 @@
                     hostConn.send({ type: 'join_viewer' });
                     $('vStatus').textContent = 'Connected. Waiting for video…';
                 });
+                hostConn.on('data', (msg) => { if (msg && msg.type === 'mode') applyViewMode(msg.mode); });
                 hostConn.on('close', lostOnce);
                 hostConn.on('error', fail);
             });
@@ -591,20 +647,34 @@
             setTimeout(() => joinAsViewer(code, 1), 3000);
         }
 
-        let overlayTimer = 0, tvCall = null;
+        let overlayTimer = 0, tvCall = null, viewMode = 'sbs', aspectTouched = false;
+
+        // Default aspect from the sender's mode: a plain TV should letterbox a mono
+        // feed (contain) but map each half of an SBS feed to an eye (fill). Once the
+        // user picks an aspect manually, stop overriding it.
+        function applyViewMode(mode) {
+            viewMode = mode || 'sbs';
+            if (aspectTouched) return;
+            const v = $('tvVideo');
+            if (viewMode === 'mono') v.classList.add('contain');
+            else v.classList.remove('contain');
+        }
+
         function showTv(stream, code) {
             show('tvWrap');
             document.body.classList.add('viewer-live');
             const v = $('tvVideo');
             v.srcObject = stream;
             v.play().catch(() => {});
-            flashOverlay('3D Live · room ' + code + ' · full-SBS');
+            applyViewMode(viewMode);
+            flashOverlay('3D Live · room ' + code + ' · ' + (viewMode === 'mono' ? 'mono' : 'side-by-side'));
             // Any remote/keyboard press: show overlay + receive stats;
             // OK/Enter toggles fill vs contain.
             document.onkeydown = async (e) => {
                 if (e.key === 'Enter') {
+                    aspectTouched = true;
                     v.classList.toggle('contain');
-                    flashOverlay(v.classList.contains('contain') ? 'Aspect: contain (letterboxed)' : 'Aspect: fill (squeezed half-SBS)');
+                    flashOverlay(v.classList.contains('contain') ? 'Aspect: contain (letterboxed)' : 'Aspect: fill (fills the screen)');
                     return;
                 }
                 // Distinguish "nothing arriving" from "arriving but not shown".
